@@ -1,0 +1,461 @@
+---
+title: "Guardian of the Vault"
+author: "Ko-Jung Wu, Manuel Fernandes, Muhammad Reynaldi, Regan Ling"
+format: pdf
+editor: visual
+---
+
+## 
+
+```{r, label = setup}
+library(tidymodels)
+library(nycflights13)
+library(readr)
+library(tidyverse)
+library(vip)
+
+packages_needed <-  c( 
+                      "GGally",
+                       'tidymodels',
+                      "nycflights13",
+                      "themis", #recipe steps for unbalanced data
+                      "kknn", #k nearest neighbour
+                      "rpart",  #decision trees
+                      "rpart.plot", #plotting decision trees
+                      "baguette", 
+                      "ranger", #random forests
+                      "xgboost", #xgboost
+                      "lightgbm", "bonsai" #lightgbm
+                      , "parallel", "future" # use multiple cores
+                      )
+packages_to_install <- packages_needed[!packages_needed %in%
+                                         installed.packages()]
+sapply(packages_to_install, install.packages,
+       dependencies=TRUE, repos="https://cloud.r-project.org")
+sapply(packages_needed, require, character=TRUE)
+
+# Set options
+name_of_this_file <- "Guardian of the Vault"  
+figprefix = paste('Rfigs/', paste0(name_of_this_file, "_"), sep="")
+
+knitr::opts_chunk$set(
+               echo = TRUE, 
+               message = FALSE,
+               warning = FALSE,
+               fig.path=figprefix,
+               fig.align='center',
+               fig.show='hold',
+               size='footnotesize', 
+               fig.width=8, fig.height=4.5, 
+               out.width="60%")
+opt_width = 70 #60
+options(width = opt_width,  
+        pillar.print_min = 6,
+        pillar.print_max = 10
+        )
+
+
+
+cores <- parallel::detectCores(logical = TRUE)
+# plan(sequential)  #no parallel processing
+plan(multisession) #parallel processing
+
+#Load the dataset
+ASBF <- read_csv("bank_A_transactions.csv")
+
+ASBF <- ASBF |>
+  mutate(TransactionDate = ymd_hms(TransactionDate),
+         Date = as.Date(TransactionDate),
+         Time = format(TransactionDate, format = "%H:%M:%S"),
+        agent_category = case_when(
+    is.na(agent) | agent == "" ~ "Offline",
+    str_detect(agent, regex("ATM", ignore_case = TRUE)) ~ "ATM",
+    str_detect(agent, regex("Android", ignore_case = TRUE)) ~ "Android",
+    str_detect(agent, regex("iPhone|iPad|iOS", ignore_case = TRUE)) ~ "iOS",
+    str_detect(agent, regex("Chrome|Firefox|Safari|Edge|IE|Opera", ignore_case = TRUE)) ~ "Browser",
+    TRUE ~ "Unknown"
+  ),
+  balance_category = case_when(
+           balance < 0 ~ "Negative",
+           balance == 0 ~ "Zero",
+           balance > 0 ~ "Positive"
+  ),
+  FraudLabel = ifelse(FraudLabel == 1, "fraud", "Nofraud"),
+  FraudLabel = as.factor(FraudLabel)) |>
+  mutate_if(is.character, as.factor)
+```
+
+```{r, label = selecting_variables}
+ASBFN <- ASBF|>
+  select(TransactionID, CustomerID, Date, Time, agent_category, joint_flag, Age, FraudLabel, TransactionAmount, balance_category, TransactionType) |>
+slice_sample(n= 50000)
+
+```
+
+```{r, label = data_partition}
+# when random numbers are used 
+set.seed(222)
+
+# Split 3/4 of the data into the training set 
+asbfn_split <- initial_split(ASBFN, prop = 0.75, strata = FraudLabel)
+
+# Create data frames for the three sets:
+asb_train_data <- training(asbfn_split)
+asb_test_data  <- testing(asbfn_split)
+
+
+# Create folds
+set.seed(987)
+cv_folds <- vfold_cv(asb_train_data, 
+          v = 10, 
+          strata = FraudLabel) 
+```
+
+```{r, label = recipe_creation}
+asb_recipe <- 
+  recipe(FraudLabel ~ ., data = asb_train_data)  |>  
+  # Combine TransactionType and agent_category for ATM withdrawals
+  step_mutate(withdrawal_atm = if_else(TransactionType == "withdrawal" & agent_category == "ATM", 1, 0)) |> 
+  # update role of ID variables  
+  update_role(TransactionID, CustomerID, Time, new_role = "ID") |> 
+  # pre-process dates - extract only day of week
+  step_date(Date, features = "dow", keep_original_cols = FALSE) |>               
+  #remove variables with NAs, skip=TRUE means this is not applied to test data
+  step_naomit(everything(), skip = TRUE) |> 
+  # normalize variables  
+  step_normalize(all_numeric_predictors())  |> 
+  # create dummy variables for nominal predictors
+  step_dummy(all_nominal_predictors())|> 
+  # remove zero variance predictors
+  step_zv(all_predictors()) |> 
+  # Resample from the minority class, so there are equal numbers of on-time/late
+  step_upsample(FraudLabel, over_ratio = 1)
+
+```
+
+```{r, label = baking_the_recipe}
+glimpse(asb_train_data)
+asb_recipe |> 
+  prep() |> 
+  bake(asb_train_data) 
+```
+
+```{r, label = all_models}
+#Logistic Model
+lr_model <- 
+  logistic_reg() |> 
+  set_engine("glm")
+
+lr_wflow <- workflow() |> 
+                  add_model(lr_model) |> 
+                  add_recipe(asb_recipe)
+lr_wflow
+
+#k-nearest neighbours
+knn_model <-
+  nearest_neighbor(neighbors = 5) |>
+  set_engine('kknn') |>
+  set_mode('classification')
+
+
+knn_wflow <- workflow() |> 
+                  add_model(knn_model) |> 
+                  add_recipe(asb_recipe)
+
+#random forest
+rf_model <- 
+  rand_forest(trees = 1000) |> 
+  set_engine("ranger", 
+             importance = "impurity"  
+             #optional - provide info about variable importance
+        ) |> 
+  set_mode("classification")
+
+rf_wflow <-   workflow() |> 
+  add_model(rf_model) |> 
+  add_recipe(asb_recipe)
+
+#XGBOOST
+xgb_model <- 
+  boost_tree() |>
+  set_engine("xgboost" ) |>
+  set_mode("classification") 
+
+xgb_wflow <- 
+  workflow() |> 
+  add_model(xgb_model) |> 
+  add_recipe(asb_recipe)
+
+#LIGHTGBM
+lgbm_model <- 
+  boost_tree() |>
+  set_engine("lightgbm" ) |>
+  set_mode("classification") 
+
+lgbm_wflow <- 
+  workflow() |> 
+  add_model(lgbm_model) |> 
+  add_recipe(asb_recipe)
+```
+
+```{r, label = metric_evaluation}
+asb_metrics <- metric_set(accuracy, roc_auc, sensitivity, specificity, bal_accuracy,
+                              ppv, npv, recall
+                              ## other metrics are possible, e.g. 
+                              #, f_meas, kap, recall, precision
+                              )
+```
+
+```{r, label = kfold_cross_validation}
+Sys.time()
+
+lr_res <- lr_wflow |>
+  fit_resamples(
+     resamples = cv_folds, 
+     metrics = asb_metrics,
+     control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")) 
+
+Sys.time()  
+
+Sys.time()
+
+knn_res <- knn_wflow |>
+  fit_resamples(
+     resamples = cv_folds, 
+     metrics = asb_metrics,
+     control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")) 
+Sys.time()
+
+rf_res <- rf_wflow |>
+  fit_resamples(
+     resamples = cv_folds, 
+      metrics = asb_metrics,
+     control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")) 
+
+Sys.time()
+xgb_res <- xgb_wflow |>
+  fit_resamples(
+     resamples = cv_folds, 
+     metrics = asb_metrics,
+     control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")) 
+Sys.time()
+
+
+lgbm_res <- lgbm_wflow |>
+  fit_resamples(
+     resamples = cv_folds, 
+     metrics = asb_metrics,
+     control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")) 
+Sys.time()
+```
+
+```{r, label = Collecting and Summarizing Model Metrics}
+#To show metrics for each fold, use the option `summarize = FALSE`
+lr_res |> collect_metrics(summarize = FALSE)
+
+#getting average across all folds
+lr_res |> collect_metrics(summarize = TRUE)
+
+#predictions
+lr_pred <- 
+  lr_res |>
+  collect_predictions()
+
+#creating confusion matrix
+lr_pred |>
+  conf_mat(truth = FraudLabel, .pred_class) 
+
+#plotting roc curve
+lr_pred |>
+  group_by(id) |> # id contains our folds
+  roc_curve(FraudLabel, .pred_fraud) |>
+  autoplot()
+```
+
+```{r, label = Comparing Model Performance}
+#individudal results
+knn_res  |> collect_metrics(summarize = TRUE)
+rf_res   |> collect_metrics(summarize = TRUE)
+xgb_res  |> collect_metrics(summarize = TRUE)
+lgbm_res |> collect_metrics(summarize = TRUE)
+
+###########################################################################
+
+# Combine results
+all_res <- 
+bind_rows(
+lr_res   |> collect_metrics(summarize = TRUE) |> mutate(model = "Logistic Regression"),
+knn_res  |> collect_metrics(summarize = TRUE) |> mutate(model = "KNN"),
+rf_res   |> collect_metrics(summarize = TRUE) |> mutate(model = "Random Forest"),
+xgb_res  |> collect_metrics(summarize = TRUE) |> mutate(model = "XGBoost"),
+lgbm_res |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM")
+)
+
+# Combine predictions
+all_pred <- 
+bind_rows(
+lr_res   |> collect_predictions()  |> mutate(model = "Logistic Regression"),
+knn_res  |> collect_predictions()  |> mutate(model = "KNN"),
+rf_res   |> collect_predictions()  |> mutate(model = "Random Forest"),
+xgb_res  |> collect_predictions()  |> mutate(model = "XGBoost"),
+lgbm_res |> collect_predictions()  |> mutate(model = "LightGBM"))
+```
+
+```{r, label = plotvisual}
+#notice the variability between each run
+all_pred |> 
+  group_by(id,model) |> # id contains our folds
+  roc_curve(FraudLabel, .pred_fraud) |>
+  autoplot(aes(col = model)) + facet_wrap(facets = vars(model)) +
+  theme(legend.position = "none") + 
+  labs(title = "ROC by fold for selected algorithms")
+
+#Plotting RES
+all_res |> 
+  ggplot() + 
+  geom_col(aes(y = reorder(model, desc(model)), x = mean, fill = model)) +
+  facet_wrap(facets = vars(.metric), ncol = 3) +
+  labs(y = "model") + 
+  xlim(0,1)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth=1))+
+  theme(legend.position = "none")
+```
+
+```{r, label = ModelFitting}
+all_res |> 
+  group_by(.metric) |> 
+  slice_max(mean) |>  
+  select(.metric, mean, model)
+
+#Best Model
+all_res |> filter(model == "XGBoost") 
+
+final_wflow <- xgb_wflow 
+
+final_fit <- 
+  final_wflow |>
+  last_fit(asbfn_split,
+               metrics = asb_metrics)
+
+final_res <- final_fit |>  collect_metrics()
+final_res
+
+
+final_pred <- final_fit |>
+  collect_predictions()
+
+final_pred |> 
+  roc_curve(truth = FraudLabel, .pred_fraud) |> 
+  autoplot()
+
+final_conf <- final_pred |>
+  conf_mat(truth = FraudLabel, .pred_class) 
+final_conf
+
+summary(final_conf) |> print(n = 13)
+
+# Calculate the AUC value
+auc_value <- final_pred |> 
+  roc_auc(truth = FraudLabel, .pred_fraud)
+
+# Plot the ROC curve with the AUC value displayed
+final_pred |> 
+  roc_curve(truth = FraudLabel, .pred_fraud) |> 
+  autoplot() +
+  annotate("text", x = 0.6, y = 0.1, label = paste("AUC =", round(auc_value$.estimate, 2)), size = 5, color = "blue") +
+  labs(title = "ROC Curve for XGBoost Model")
+
+```
+
+```{r, label = Feature Importance Visualization}
+library(vip)
+final_fit |>
+  pluck(".workflow", 1) |>  
+  pull_workflow_fit() |>
+  vip(num_features = 10) +
+  theme_minimal() +
+  labs(title = "Top 10 Feature Importance from Model",
+       x = "Importance",
+       y = "Feature") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r, label = quantify_features}
+# 1. Age distribution for fraudulent vs non-fraudulent transactions
+age_summary <- ASBF |>
+  group_by(FraudLabel) |>
+  summarize(mean_age = mean(Age, na.rm = TRUE),
+            sd_age = sd(Age, na.rm = TRUE),
+            median_age = median(Age, na.rm = TRUE))
+
+print(age_summary)
+
+# 2. Transaction Amount distribution
+transaction_summary <- ASBF |>
+  group_by(FraudLabel) |>
+  summarize(mean_amount = mean(TransactionAmount, na.rm = TRUE),
+            median_amount = median(TransactionAmount, na.rm = TRUE))
+
+print(transaction_summary)
+
+# 3. Balance category fraud rate
+balance_fraud_rate <- ASBF |>
+  group_by(balance_category) |>
+  summarize(fraud_rate = mean(FraudLabel == "fraud"))
+
+print(balance_fraud_rate)
+
+
+# Summarize fraud occurrences by day of the week
+fraud_by_day <- ASBF |>
+  filter(FraudLabel == "fraud") |>
+  mutate(day_of_week = weekdays(Date)) |>
+  group_by(day_of_week) |>
+  summarize(fraud_count = n()) |>
+  arrange(desc(fraud_count))
+
+print(fraud_by_day)
+
+
+
+```
+
+```{r, label = Visualization of Feature Distribution}
+# Visualizing Age Distribution
+ggplot(ASBF, aes(x = Age, fill = FraudLabel)) +
+  geom_histogram(binwidth = 5, position = "dodge") +
+  labs(title = "Age Distribution for Fraudulent vs Non-Fraudulent Transactions",
+       x = "Age",
+       y = "Count") +
+  theme_minimal()
+
+# Visualizing Transaction Amount
+ggplot(ASBF, aes(x = TransactionAmount, fill = FraudLabel)) +
+  geom_histogram(binwidth = 1000, position = "dodge") +
+  labs(title = "Transaction Amount Distribution for Fraudulent vs Non-Fraudulent Transactions",
+       x = "Transaction Amount",
+       y = "Count") +
+  theme_minimal()
+
+# Visualizing Fraud Rate by Balance Category
+ggplot(balance_fraud_rate, aes(x = balance_category, y = fraud_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Fraud Rate by Balance Category",
+       x = "Balance Category",
+       y = "Fraud Rate") +
+  theme_minimal()
+
+# Visualize Fraud by Day
+ggplot(fraud_by_day, aes(x = reorder(day_of_week, -fraud_count), y = fraud_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Fraud Occurrences by Day of the Week",
+       x = "Day of the Week",
+       y = "Number of Fraudulent Transactions") +
+  theme_minimal()
+
+```
