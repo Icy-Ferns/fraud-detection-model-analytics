@@ -82,32 +82,7 @@ The analysis also produces ROC curves, a confusion matrix, and feature importanc
 
 - R (and ideally RStudio).
 - Quarto (to render the `.qmd` into HTML/PDF).
-
-### Install packages (from `requirements.txt`)
-
-This repo uses an R package list stored in `requirements.txt` (one package name per line).
-
-In R:
-
-```r
-pkgs <- readLines("requirements.txt")
-install.packages(pkgs, dependencies = TRUE)
-```
-
-### Provide the dataset locally
-
-Because `bank_A_transactions.csv` is not in this repo, download/prepare the dataset locally and place it at one of these paths:
-
-- Option 1 (recommended): `data/bank_A_transactions.csv`
-- Option 2: repository root as `bank_A_transactions.csv`
-
-Then update the dataset path in `Guardian_of_the_vault_Analytics.qmd` to match your chosen location.
-
-### Render the Quarto report
-
-```bash
-quarto render Guardian_of_the_vault_Analytics.qmd
-```
+- update the dataset path in `Guardian_of_the_vault_Analytics.qmd` to match your chosen location.
 
 ## Repository contents
 
@@ -115,7 +90,6 @@ quarto render Guardian_of_the_vault_Analytics.qmd
 - `Poster-Guardian-of-the-vault.pdf`: One-page project summary and recommendations.
 - `Project-metadata.pdf`: Data dictionary for Bank A transaction fields.
 - `ASB_casestudy.pdf`: Industry context / case-study material on analytics in banking (ASB).
+- `Readme.md` : Thats me :)
 
-## License
-
-MIT License (see `LICENSE`).
+### Please note that this project was achieved through collaborative efforts.
